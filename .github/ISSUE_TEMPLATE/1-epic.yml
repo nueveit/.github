@@ -1,0 +1,37 @@
+name: Epic
+description: A large body of work that is broken down into stories
+type: Epic
+projects: ["nueveit/9"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome does this epic deliver and why?
+    validations:
+      required: true
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      options:
+        - OAO
+        - Refer-a-Friend
+        - Self-Service CDs
+        - Automate Banking
+        - Platform / Shared
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is in and out of scope?
+  - type: textarea
+    id: done
+    attributes:
+      label: Definition of done
+      description: How will we know this epic is complete?
+  - type: markdown
+    attributes:
+      value: After creating the epic, add its stories as **sub-issues**.
