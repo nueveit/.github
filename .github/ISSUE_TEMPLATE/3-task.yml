@@ -1,0 +1,29 @@
+name: Task
+description: A specific piece of technical work
+type: Task
+projects: ["nueveit/9"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What needs to be done
+    validations:
+      required: true
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      options:
+        - OAO
+        - Refer-a-Friend
+        - Self-Service CDs
+        - Automate Banking
+        - Platform / Shared
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      value: |
+        - [ ] 

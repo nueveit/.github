@@ -1,0 +1,27 @@
+name: Feature request
+description: An idea or request for new functionality
+type: Feature
+projects: ["nueveit/9"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / need
+    validations:
+      required: true
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      options:
+        - OAO
+        - Refer-a-Friend
+        - Self-Service CDs
+        - Automate Banking
+        - Platform / Shared
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution

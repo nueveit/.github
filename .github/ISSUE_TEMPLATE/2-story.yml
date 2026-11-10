@@ -1,0 +1,42 @@
+name: Story
+description: A user-facing piece of functionality (add it as a sub-issue of its epic)
+type: Story
+projects: ["nueveit/9"]
+body:
+  - type: textarea
+    id: story
+    attributes:
+      label: User story
+      value: |
+        As a <role>, I want <capability>, so that <benefit>.
+    validations:
+      required: true
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      options:
+        - OAO
+        - Refer-a-Friend
+        - Self-Service CDs
+        - Automate Banking
+        - Platform / Shared
+    validations:
+      required: true
+  - type: input
+    id: epic
+    attributes:
+      label: Parent epic
+      description: "Epic issue link or #number — then set it as Parent issue"
+  - type: textarea
+    id: ac
+    attributes:
+      label: Acceptance criteria
+      value: |
+        - [ ] 
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Technical notes

@@ -1,0 +1,49 @@
+name: Bug
+description: Something is broken or behaving unexpectedly
+type: Bug
+projects: ["nueveit/9"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not paste customer data, account numbers, tokens or passwords. Mask them (e.g. ****1234)."
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      options:
+        - OAO
+        - Refer-a-Friend
+        - Self-Service CDs
+        - Automate Banking
+        - Platform / Shared
+    validations:
+      required: true
+  - type: dropdown
+    id: env
+    attributes:
+      label: Environment
+      options:
+        - Production
+        - UAT / Staging
+        - Development
+        - Local
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1. 
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / screenshots (redacted)
