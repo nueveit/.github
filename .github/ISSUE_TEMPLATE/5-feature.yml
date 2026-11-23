@@ -9,18 +9,9 @@ body:
       label: Problem / need
     validations:
       required: true
-  - type: dropdown
-    id: product
+  - type: markdown
     attributes:
-      label: Product
-      options:
-        - OAO
-        - Refer-a-Friend
-        - Self-Service CDs
-        - Automate Banking
-        - Platform / Shared
-    validations:
-      required: true
+      value: "Set **Product** in the sidebar on the right. The list is managed in org Settings > Issue fields > Product."
   - type: textarea
     id: proposal
     attributes:

@@ -6,18 +6,9 @@ body:
   - type: markdown
     attributes:
       value: "Do not paste customer data, account numbers, tokens or passwords. Mask them (e.g. ****1234)."
-  - type: dropdown
-    id: product
+  - type: markdown
     attributes:
-      label: Product
-      options:
-        - OAO
-        - Refer-a-Friend
-        - Self-Service CDs
-        - Automate Banking
-        - Platform / Shared
-    validations:
-      required: true
+      value: "Set **Product** in the sidebar on the right. The list is managed in org Settings > Issue fields > Product."
   - type: dropdown
     id: env
     attributes:
