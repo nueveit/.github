@@ -1,0 +1,423 @@
+name: Time Tracking & Two-Way Sync
+# Shared org workflow. Each repo calls it from a small caller on issue_comment:
+#
+#   on:
+#     issue_comment:
+#       types: [created, edited, deleted]
+#   permissions: {}
+#   jobs:
+#     sync:
+#       uses: nueveit/.github/.github/workflows/time-tracking.yml@v1
+#       secrets: inherit
+#
+# The caller's event (comment, issue) is what this workflow sees as github.event.
+on:
+  workflow_call:
+    secrets:
+      PROJECT_TOKEN:
+        required: true
+  # Manual whole-board sweep (Actions tab of nueveit/.github), e.g. after estimates
+  # are changed on the board. Needs PROJECT_TOKEN available to this repo.
+  workflow_dispatch:
+
+# Least privilege: the default GITHUB_TOKEN gets no access. PROJECT_TOKEN does the work.
+permissions: {}
+
+# ==============================================================================
+# CONFIGURATION: Update the values below to match your Project
+# ==============================================================================
+env:
+  PROJECT_OWNER: "nueveit"             # GitHub organization login or personal username
+  PROJECT_NUMBER: "9"                  # Number from your Project URL (.../projects/9)
+  IS_ORG: "true"                       # "true" for Organization project, "false" for Personal user project
+  HOURS_PER_DAY: "8"                   # Conversion rate for '1d' (e.g., 8 hours)
+
+  # Custom Field & Status Names (must match your Project Settings exactly)
+  FIELD_ORIGINAL_ESTIMATE: "Estimation (in hours)"
+  FIELD_TIME_SPENT: "Time spent (in hours)"
+  FIELD_TIME_REMAINING: "Time remaining"
+  STATUS_OVERRUN: "Overrun"            # Target Status when Time Spent > Original Estimate
+  STATUS_IN_PROGRESS: "In Progress"    # Target Status when an Overrun item returns within estimate
+# ==============================================================================
+
+jobs:
+  sync-time:
+    # Start only for time commands on issues (not PRs). A skipped job uses 0 minutes.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (!github.event.issue.pull_request &&
+       (contains(github.event.comment.body, '/log') ||
+        contains(github.event.comment.body, '/time') ||
+        contains(github.event.comment.body, '/remaining') ||
+        contains(github.event.changes.body.from, '/log') ||
+        contains(github.event.changes.body.from, '/time') ||
+        contains(github.event.changes.body.from, '/remaining')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5                 # a stuck run can't burn hours of billed time
+    # One run at a time so two runs never overwrite each other's numbers.
+    # Job-level: skipped runs (plain comments) never join the group.
+    # queue: max: waiting runs line up (FIFO, up to 100) instead of cancelling each other.
+    concurrency:
+      group: time-tracking
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Sync ProjectV2 Time Fields
+        env:
+          # PROJECT_TOKEN needs: Organization > Projects: read & write,
+          # Repository > Issues: read & write (read comments, add/remove 😕 reactions).
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - << 'EOF'
+          import os, re, json, subprocess, sys
+
+          # Load configuration variables
+          PROJECT_OWNER = os.environ["PROJECT_OWNER"].strip()
+          PROJECT_NUMBER = int(os.environ["PROJECT_NUMBER"])
+          IS_ORG = os.environ["IS_ORG"].strip().lower() == "true"
+          HOURS_PER_DAY = float(os.environ["HOURS_PER_DAY"])
+
+          F_ORIG = os.environ["FIELD_ORIGINAL_ESTIMATE"]
+          F_SPENT = os.environ["FIELD_TIME_SPENT"]
+          F_REM = os.environ["FIELD_TIME_REMAINING"]
+          STATUS_OVERRUN = os.environ["STATUS_OVERRUN"].strip()
+          STATUS_IN_PROGRESS = os.environ["STATUS_IN_PROGRESS"].strip()
+
+          event_name = os.environ["EVENT_NAME"]
+
+          with open(os.environ["GITHUB_EVENT_PATH"], "r", encoding="utf-8") as f:
+              event = json.load(f)
+
+          def gh_graphql(query, variables, fatal=True):
+              """Call the GitHub GraphQL API. On error: stop with a clear message, or warn and return None if not fatal."""
+              payload = json.dumps({"query": query, "variables": variables})
+              res = subprocess.run(
+                  ["gh", "api", "graphql", "--input", "-"],
+                  input=payload, text=True, capture_output=True
+              )
+              if res.returncode != 0:
+                  err = f"GitHub API call failed (check PROJECT_TOKEN access/expiry): {res.stderr.strip()}"
+              else:
+                  data = json.loads(res.stdout)
+                  if not data.get("errors"):
+                      return data
+                  err = f"GitHub API returned errors: {data['errors']}"
+              if fatal:
+                  sys.exit(err)
+              print(f"Warning: {err}")
+              return None
+
+          # Duration grammar: "2h", "2h30m", "2h 30m", "2h, 30m", "1h and 15 minutes",
+          # "30min", "2 hours", "1.5d". A trailing number without a unit ("2h30") is
+          # rejected instead of being silently dropped.
+          UNIT = r'(?:d|days?|h|hrs?|hours?|m|mins?|minutes?)(?![a-z])'
+          TOKEN = rf'\d+(?:\.\d+)?[ \t]*{UNIT}'
+          SEP = r'(?:[ \t]*,[ \t]*|[ \t]+and[ \t]+|[ \t]*)'
+          DURATION = rf'({TOKEN}(?:{SEP}{TOKEN})*)(?!{SEP}\d)'
+
+          COMMAND_PATTERNS = [
+              ("clear", re.compile(r'^[ \t]*/time[ \t]+clear\b', re.I)),
+              ("log", re.compile(rf'^[ \t]*/log[ \t]+{DURATION}', re.I)),
+              ("set", re.compile(rf'^[ \t]*/time[ \t]+set[ \t]+{DURATION}', re.I)),
+              ("remaining", re.compile(rf'^[ \t]*/remaining[ \t]+{DURATION}', re.I)),
+          ]
+
+          def duration_to_hours(text):
+              total = 0.0
+              for val, unit in re.findall(rf'(\d+(?:\.\d+)?)[ \t]*({UNIT})', text.lower()):
+                  v = float(val)
+                  if unit[0] == 'd': total += v * HOURS_PER_DAY
+                  elif unit[0] == 'h': total += v
+                  else: total += v / 60.0
+              return round(total, 2)
+
+          def set_num(pid, iid, fields, field_name, val):
+              field_info = fields.get(field_name)
+              if not field_info:
+                  print(f"Warning: Number field '{field_name}' not found in project. Available: {list(fields.keys())}")
+                  return
+              fid = field_info["id"]
+              if val is None:
+                  m = "mutation($pid:ID!,$iid:ID!,$fid:ID!){clearProjectV2ItemFieldValue(input:{projectId:$pid,itemId:$iid,fieldId:$fid}){projectV2Item{id}}}"
+                  gh_graphql(m, {"pid": pid, "iid": iid, "fid": fid})
+              else:
+                  m = "mutation($pid:ID!,$iid:ID!,$fid:ID!,$v:Float!){updateProjectV2ItemFieldValue(input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{number:$v}}){projectV2Item{id}}}"
+                  gh_graphql(m, {"pid": pid, "iid": iid, "fid": fid, "v": float(val)})
+
+          def set_status(pid, iid, fields, target_status_name, current_status_name=None):
+              if current_status_name == target_status_name:
+                  return
+              status_field = fields.get("Status")
+              if not status_field or "options" not in status_field:
+                  return
+              opt_id = status_field["options"].get(target_status_name)
+              if not opt_id:
+                  print(f"Warning: Status option '{target_status_name}' not found. Available: {list(status_field['options'].keys())}")
+                  return
+              m = "mutation($pid:ID!,$iid:ID!,$fid:ID!,$oid:String!){updateProjectV2ItemFieldValue(input:{projectId:$pid,itemId:$iid,fieldId:$fid,value:{singleSelectOptionId:$oid}}){projectV2Item{id}}}"
+              gh_graphql(m, {"pid": pid, "iid": iid, "fid": status_field["id"], "oid": opt_id})
+
+          def build_fields_map(field_nodes):
+              fmap = {}
+              for f in field_nodes:
+                  if "name" not in f:
+                      continue
+                  entry = {"id": f["id"]}
+                  if "options" in f:
+                      entry["options"] = {o["name"]: o["id"] for o in f["options"]}
+                  fmap[f["name"]] = entry
+              return fmap
+
+          def extract_commands(body):
+              """Every time command in the comment, one per line, in line order."""
+              cmds = []
+              for line in (body or "").splitlines():
+                  for cmd_type, pattern in COMMAND_PATTERNS:
+                      m = pattern.match(line)
+                      if m:
+                          cmds.append((cmd_type, duration_to_hours(m.group(1)) if m.groups() else None))
+                          break
+              return cmds
+
+          COMMAND_LIKE = re.compile(r'^[ \t]*/(?:log|time|remaining)\b', re.I)
+
+          def unparsed_command_lines(body):
+              """Lines that start like a time command but don't match any valid form."""
+              return [
+                  line.strip() for line in (body or "").splitlines()
+                  if COMMAND_LIKE.match(line) and not any(p.match(line) for _, p in COMMAND_PATTERNS)
+              ]
+
+          def sync_confused_reaction(comment_id, want):
+              """Add 😕 to a comment with an unrecognised command; remove it once the comment is fixed.
+              Best effort: a reaction failure never blocks the time sync."""
+              q = "query($id:ID!){node(id:$id){... on IssueComment{reactionGroups{content viewerHasReacted}}}}"
+              data = gh_graphql(q, {"id": comment_id}, fatal=False)
+              if data is None:
+                  return
+              groups = (data["data"]["node"] or {}).get("reactionGroups") or []
+              has = any(g["content"] == "CONFUSED" and g["viewerHasReacted"] for g in groups)
+              if want == has:
+                  return
+              op = "addReaction" if want else "removeReaction"
+              m = f"mutation($id:ID!){{{op}(input:{{subjectId:$id,content:CONFUSED}}){{reaction{{content}}}}}}"
+              gh_graphql(m, {"id": comment_id}, fatal=False)
+
+          def all_issue_comments(issue_id):
+              """Read every comment on the issue, 100 at a time (no 100-comment cap)."""
+              bodies, cursor = [], None
+              q = """
+              query($id: ID!, $after: String) {
+                node(id: $id) {
+                  ... on Issue {
+                    comments(first: 100, after: $after) {
+                      nodes { body }
+                      pageInfo { hasNextPage endCursor }
+                    }
+                  }
+                }
+              }
+              """
+              while True:
+                  node = gh_graphql(q, {"id": issue_id, "after": cursor})["data"]["node"] or {}
+                  c = node.get("comments")
+                  if not c:
+                      return bodies
+                  bodies += [n.get("body") or "" for n in c["nodes"]]
+                  if not c["pageInfo"]["hasNextPage"]:
+                      return bodies
+                  cursor = c["pageInfo"]["endCursor"]
+
+          FIELDS_FRAGMENT = """
+            fields(first: 40) {
+              nodes {
+                ... on ProjectV2Field { id name }
+                ... on ProjectV2SingleSelectField { id name options { id name } }
+              }
+            }
+          """
+
+          # 1. Instant Slash Commands & Replay on Comment Created / Edited / Deleted
+          if event_name == "issue_comment":
+              # Pull request comments are skipped (also filtered by the job-level `if`).
+              if "pull_request" in event.get("issue", {}):
+                  sys.exit(0)
+
+              comment = event.get("comment", {})
+              comment_body = comment.get("body", "")
+              old_body = event.get("changes", {}).get("body", {}).get("from", "")
+
+              # Tell the author when a command line wasn't understood (and clear 😕 once fixed).
+              bad_lines = unparsed_command_lines(comment_body)
+              for line in bad_lines:
+                  print(f"Warning: unrecognised time command: {line!r}")
+              if event.get("action") in ("created", "edited") and comment.get("node_id") and \
+                      (bad_lines or unparsed_command_lines(old_body)):
+                  sync_confused_reaction(comment["node_id"], bool(bad_lines))
+
+              if not extract_commands(comment_body) and not extract_commands(old_body):
+                  sys.exit(0)
+
+              issue_id = event["issue"]["node_id"]
+              q = f"""
+              query($id: ID!, $fOrig: String!) {{
+                node(id: $id) {{
+                  ... on Issue {{
+                    projectItems(first: 10) {{
+                      nodes {{
+                        id
+                        project {{
+                          id
+                          number
+                          {FIELDS_FRAGMENT}
+                        }}
+                        orig: fieldValueByName(name: $fOrig) {{ ... on ProjectV2ItemFieldNumberValue {{ number }} }}
+                        status: fieldValueByName(name: "Status") {{ ... on ProjectV2ItemFieldSingleSelectValue {{ name }} }}
+                      }}
+                    }}
+                  }}
+                }}
+              }}
+              """
+              data = gh_graphql(q, {"id": issue_id, "fOrig": F_ORIG})
+              issue_node = data["data"]["node"] or {}
+              items = (issue_node.get("projectItems") or {}).get("nodes") or []
+              if not items:
+                  print("Issue is not on any project board; nothing to update.")
+                  sys.exit(0)
+
+              item = next((i for i in items if i["project"]["number"] == PROJECT_NUMBER), None)
+              if item is None:
+                  print(f"Issue is not on project #{PROJECT_NUMBER}; nothing to update.")
+                  sys.exit(0)
+
+              pid = item["project"]["id"]
+              iid = item["id"]
+              fields = build_fields_map(item["project"]["fields"]["nodes"])
+
+              cur_orig = (item.get("orig") or {}).get("number")
+              cur_status = (item.get("status") or {}).get("name")
+              orig_val = cur_orig or 0.0
+
+              has_commands = False
+              spent_val = 0.0
+              rem_val = cur_orig            # stays None (blank) when there is no estimate
+
+              for body in all_issue_comments(issue_id):
+                  for cmd_type, hours in extract_commands(body):
+                      has_commands = True
+
+                      if cmd_type == "log":
+                          spent_val = round(spent_val + hours, 2)
+                          if rem_val is not None:
+                              rem_val = round(max(0.0, rem_val - hours), 2)
+
+                      elif cmd_type == "set":
+                          spent_val = round(hours, 2)
+                          rem_val = round(max(0.0, orig_val - spent_val), 2) if cur_orig is not None else None
+
+                      elif cmd_type == "remaining":
+                          rem_val = round(hours, 2)
+                          if cur_orig is not None:
+                              spent_val = round(max(0.0, orig_val - rem_val), 2)
+
+                      elif cmd_type == "clear":
+                          spent_val = 0.0
+                          rem_val = cur_orig
+                          has_commands = False
+
+              if not has_commands:
+                  set_num(pid, iid, fields, F_SPENT, None)
+                  set_num(pid, iid, fields, F_REM, cur_orig)
+                  if cur_status == STATUS_OVERRUN:
+                      set_status(pid, iid, fields, STATUS_IN_PROGRESS, cur_status)
+              else:
+                  set_num(pid, iid, fields, F_SPENT, spent_val)
+                  set_num(pid, iid, fields, F_REM, rem_val)
+                  if cur_orig is not None and spent_val > cur_orig:
+                      set_status(pid, iid, fields, STATUS_OVERRUN, cur_status)
+                  elif cur_status == STATUS_OVERRUN and (cur_orig is None or spent_val <= cur_orig):
+                      set_status(pid, iid, fields, STATUS_IN_PROGRESS, cur_status)
+
+          # 2. Two-Way Complement & Overrun Enforcement across the board (Manual Run)
+          else:
+              root = "organization" if IS_ORG else "user"
+              q_proj = (
+                  f"query($login: String!, $num: Int!, $fOrig: String!, $fSpent: String!, $fRem: String!, $after: String) {{"
+                  f"  {root}(login: $login) {{"
+                  f"    projectV2(number: $num) {{"
+                  f"      id"
+                  f"      {FIELDS_FRAGMENT}"
+                  f"      items(first: 100, after: $after) {{"
+                  f"        nodes {{"
+                  f"          id"
+                  f"          orig: fieldValueByName(name: $fOrig) {{ ... on ProjectV2ItemFieldNumberValue {{ number }} }}"
+                  f"          spent: fieldValueByName(name: $fSpent) {{ ... on ProjectV2ItemFieldNumberValue {{ number }} }}"
+                  f"          rem: fieldValueByName(name: $fRem) {{ ... on ProjectV2ItemFieldNumberValue {{ number }} }}"
+                  f"          status: fieldValueByName(name: \"Status\") {{ ... on ProjectV2ItemFieldSingleSelectValue {{ name }} }}"
+                  f"        }}"
+                  f"        pageInfo {{ hasNextPage endCursor }}"
+                  f"      }}"
+                  f"    }}"
+                  f"  }}"
+                  f"}}"
+              )
+
+              cursor, pid, fields, checked, updated = None, None, None, 0, 0
+              while True:
+                  res = gh_graphql(q_proj, {
+                      "login": PROJECT_OWNER,
+                      "num": PROJECT_NUMBER,
+                      "fOrig": F_ORIG,
+                      "fSpent": F_SPENT,
+                      "fRem": F_REM,
+                      "after": cursor
+                  })
+                  proj = (res["data"].get(root) or {}).get("projectV2")
+                  if not proj:
+                      sys.exit(f"Project #{PROJECT_NUMBER} not found for '{PROJECT_OWNER}' (check PROJECT_TOKEN has project access).")
+                  if pid is None:
+                      pid = proj["id"]
+                      fields = build_fields_map(proj["fields"]["nodes"])
+
+                  for item in proj["items"]["nodes"]:
+                      checked += 1
+                      iid = item["id"]
+                      orig = (item.get("orig") or {}).get("number")
+                      spent = (item.get("spent") or {}).get("number")
+                      rem = (item.get("rem") or {}).get("number")
+                      cur_status = (item.get("status") or {}).get("name")
+
+                      if orig is None:
+                          if cur_status == STATUS_OVERRUN:
+                              set_status(pid, iid, fields, STATUS_IN_PROGRESS, cur_status)
+                              updated += 1
+                          continue
+
+                      if spent is not None:
+                          expected_rem = round(max(0.0, orig - spent), 2)
+                          # Write only when the value is actually wrong (no endless rewrites on overrun items).
+                          if rem is None or round(rem, 2) != expected_rem:
+                              set_num(pid, iid, fields, F_REM, expected_rem)
+                              updated += 1
+                      elif rem is not None:
+                          set_num(pid, iid, fields, F_SPENT, round(max(0.0, orig - rem), 2))
+                          spent = round(max(0.0, orig - rem), 2)
+                          updated += 1
+
+                      if spent is not None and spent > orig:
+                          if cur_status != STATUS_OVERRUN:
+                              set_status(pid, iid, fields, STATUS_OVERRUN, cur_status)
+                              updated += 1
+                      elif cur_status == STATUS_OVERRUN:
+                          set_status(pid, iid, fields, STATUS_IN_PROGRESS, cur_status)
+                          updated += 1
+
+                  page = proj["items"]["pageInfo"]
+                  if not page["hasNextPage"]:
+                      break
+                  cursor = page["endCursor"]
+
+              print(f"Checked {checked} items, made {updated} updates.")
+          EOF
