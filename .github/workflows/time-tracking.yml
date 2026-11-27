@@ -180,13 +180,19 @@ jobs:
                           break
               return cmds
 
-          COMMAND_LIKE = re.compile(r'^[ \t]*/(?:log|time|remaining)\b', re.I)
+          # A time command anywhere in a line (start or after a space, followed by a space or
+          # line end), so "/timeline" and "https://x/log/1" are not commands.
+          COMMAND_LIKE = re.compile(r'(?:^|[ \t])/(?:log|time|remaining)(?=[ \t]|$)', re.I)
 
           def unparsed_command_lines(body):
-              """Lines that start like a time command but don't match any valid form."""
+              """Lines that mention a time command but don't start with a valid one, e.g.
+              "/log 2h30" or "done with API /log 2h" (commands only count at line start).
+              Quoted lines ("> /log 2h", from Quote reply) are never counted or flagged."""
               return [
                   line.strip() for line in (body or "").splitlines()
-                  if COMMAND_LIKE.match(line) and not any(p.match(line) for _, p in COMMAND_PATTERNS)
+                  if not line.lstrip().startswith(">")
+                  and COMMAND_LIKE.search(line)
+                  and not any(p.match(line) for _, p in COMMAND_PATTERNS)
               ]
 
           def sync_confused_reaction(comment_id, want):
